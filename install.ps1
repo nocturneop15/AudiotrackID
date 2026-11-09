@@ -112,9 +112,11 @@ if ($Setup) {
 
 Write-Host ''
 Write-Host 'AudiotrackID installed.' -ForegroundColor Green
-Write-Host '  AudiotrackID "D:\Movies" -DryRun     # from any terminal (open a new one if the command is not found)'
-Write-Host '  Explorer: right-click a folder > Send to > AudiotrackID'
+if ($NoPath) { Write-Host "  & '$(Join-Path $InstallDir 'AudiotrackID.cmd')' ""D:\Movies"" -DryRun" }
+else { Write-Host '  AudiotrackID "D:\Movies" -DryRun     # from any terminal (open a new one if the command is not found)' }
+if (-not $NoSendTo) { Write-Host '  Explorer: right-click a folder > Send to > AudiotrackID' }
 if (-not $Setup) { Write-Host '  Tools and models (~1.4 GB) are downloaded automatically on first run.' }
 Write-Host '  Update: run the install command again.'
-Write-Host '  Uninstall: & ([scriptblock]::Create((irm https://raw.githubusercontent.com/nocturneop15/AudiotrackID/main/install.ps1))) -Uninstall'
+$dirArg = if ($InstallDir -ne (Join-Path $env:LOCALAPPDATA 'AudiotrackID')) { " -InstallDir '$InstallDir'" } else { '' }
+Write-Host "  Uninstall: & ([scriptblock]::Create((irm https://raw.githubusercontent.com/$Repo/main/install.ps1))) -Uninstall$dirArg"
 }
