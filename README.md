@@ -19,6 +19,7 @@ AudiotrackID.cmd -Setup                      # download/update all tools (for of
 | Option | Default | Meaning |
 |---|---|---|
 | `-Model` | `small` | Whisper model: `tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turbo` |
+| `-Device` | `Auto` | `Auto` benchmarks the CPU and every GPU once per machine and model, then uses the fastest. `Gpu` uses the fastest GPU, `Cpu` never uses a GPU |
 | `-VerifyModel` | `large-v3-turbo-q5_0` | second opinion: when `-Model` is under `-VerifyBelow`, the same excerpts are re-checked with this larger model. It is far better with accents (e.g. Scottish English) but ~5× slower on CPU. `''` disables it |
 | `-VerifyBelow` | `0.9` | confidence under which the second opinion is requested |
 | `-Samples` | `6` | random excerpts per track (a 2nd round is taken automatically if unclear) |
@@ -50,6 +51,20 @@ AudiotrackID.cmd -Setup                      # download/update all tools (for of
    * **MP4 / MOV / AVI / TS / ...**: lossless `ffmpeg -c copy` remux to a temp file. It is checked,
      swapped in, and the original modification time is kept.
 
+## GPU acceleration
+
+Any GPU with a Vulkan driver works: AMD, Intel or NVIDIA, including integrated graphics. whisper.cpp
+has no Vulkan build for Windows, so the tool combines its `whisper-cli` with the GPU backend DLLs from
+the matching llama.cpp release (`tools\whisper-vulkan\`). The versions are pinned in the script
+(`$WhisperRelease`, `$LlamaRelease`) and tested together.
+
+The first time a model is used on a machine, the tool times the CPU and each GPU on a short test
+clip, uses the fastest, and remembers the choice in `tools\device-cache.json`. When the folder is
+copied to another PC, the test runs again there. If a GPU run fails, it falls back to the CPU.
+
+Example (Ryzen 7 8840HS, Radeon 780M integrated GPU): `large-v3-turbo` took 31.5 s on the CPU and
+5.7 s on the GPU in the benchmark. A whole film took 222 s on the CPU and 51 s on the GPU.
+
 ## Portability
 
 Nothing needs to be installed. On first run (or with `-Setup`) everything is downloaded
@@ -59,6 +74,7 @@ Whisper models:
 ```
 tools\ffmpeg\      ffmpeg.exe, ffprobe.exe          (BtbN static build)
 tools\whisper\     whisper-cli.exe + DLLs           (ggml-org/whisper.cpp, CPU x64)
+tools\whisper-vulkan\  same + Vulkan ggml DLLs      (from ggml-org/llama.cpp Vulkan build)
 tools\mkvtoolnix\  mkvpropedit.exe                  (MKVToolNix portable)
 tools\models\      ggml-small.bin, ggml-large-v3-turbo-q5_0.bin, Silero VAD model
 ```

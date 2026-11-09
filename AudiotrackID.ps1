@@ -40,6 +40,10 @@ param(
     # Confidence (0-1) under which the -VerifyModel second opinion is requested.
     [ValidateRange(0.0, 1.0)][double]$VerifyBelow = 0.9,
 
+    # Where Whisper runs. Auto = benchmark CPU and every Vulkan GPU once per machine/model and use
+    # the fastest (cached in tools\device-cache.json); Gpu = fastest GPU without the CPU comparison.
+    [ValidateSet('Auto', 'Cpu', 'Gpu')][string]$Device = 'Auto',
+
     # Number of random excerpts per track (a second round is taken if the result is unclear).
     [ValidateRange(1, 50)][int]$Samples = 6,
 
@@ -341,6 +345,12 @@ function Invoke-Tool([string]$Exe, [string[]]$Arguments, [string]$WorkDir) {
 $Ffmpeg = Join-Path $ToolsDir 'ffmpeg\ffmpeg.exe'
 $Ffprobe = Join-Path $ToolsDir 'ffmpeg\ffprobe.exe'
 $WhisperCli = Join-Path $ToolsDir 'whisper\whisper-cli.exe'
+$WhisperVkCli = Join-Path $ToolsDir 'whisper-vulkan\whisper-cli.exe'
+$DeviceCacheFile = Join-Path $ToolsDir 'device-cache.json'
+# Pinned, tested combination. whisper.cpp ships no Vulkan build for Windows, so the GPU variant is
+# whisper-cli + the ggml backend DLLs (incl. ggml-vulkan.dll) from the matching llama.cpp release.
+$WhisperRelease = 'b5454'
+$LlamaRelease = 'b12211'
 $MkvPropEdit = Join-Path $ToolsDir 'mkvtoolnix\mkvpropedit.exe'
 $ModelFile = Join-Path $ToolsDir "models\ggml-$Model.bin"
 $VadModelFile = Join-Path $ToolsDir 'models\ggml-silero-v5.1.2.bin'
@@ -391,17 +401,24 @@ function Install-Tools([switch]$Update) {
             Expand-ZipEntries $zip (Split-Path $Ffmpeg) { param($n) $n -match '/bin/(ffmpeg|ffprobe)\.exe$' }
         }
         if ($Update -or -not (Test-Path $WhisperCli)) {
-            Write-Host 'Installing whisper.cpp ...' -ForegroundColor Cyan
-            $rels = Invoke-RestMethod -UseBasicParsing 'https://api.github.com/repos/ggml-org/whisper.cpp/releases?per_page=40' -Headers @{ 'User-Agent' = 'AudiotrackID' }
-            $asset = $null
-            foreach ($r in $rels) {
-                $asset = $r.assets | Where-Object { $_.name -eq 'whisper-bin-x64.zip' } | Select-Object -First 1
-                if ($asset) { Write-Host "  whisper.cpp release $($r.tag_name)" -ForegroundColor DarkGray; break }
-            }
-            if (-not $asset) { throw 'Could not find whisper-bin-x64.zip in whisper.cpp releases.' }
+            Write-Host "Installing whisper.cpp $WhisperRelease ..." -ForegroundColor Cyan
             $zip = Join-Path $dl 'whisper.zip'
-            Save-Download $asset.browser_download_url $zip
+            Save-Download "https://github.com/ggml-org/whisper.cpp/releases/download/$WhisperRelease/whisper-bin-x64.zip" $zip
             Expand-ZipEntries $zip (Split-Path $WhisperCli) { param($n) $n -match '(whisper-cli\.exe|\.dll)$' }
+        }
+        if ($Update -or -not (Test-Path $WhisperVkCli)) {
+            Write-Host "Installing GPU (Vulkan) backend from llama.cpp $LlamaRelease ..." -ForegroundColor Cyan
+            try {
+                $vkDir = Split-Path $WhisperVkCli
+                $zip = Join-Path $dl 'llama-vulkan.zip'
+                Save-Download "https://github.com/ggml-org/llama.cpp/releases/download/$LlamaRelease/llama-$LlamaRelease-bin-win-vulkan-x64.zip" $zip
+                New-Item -ItemType Directory -Force $vkDir | Out-Null
+                Copy-Item (Join-Path (Split-Path $WhisperCli) '*') $vkDir -Exclude 'whisper-cli.exe' -Force
+                Expand-ZipEntries $zip $vkDir { param($n) $n -match '(^|/)(ggml[^/]*|libomp[^/]*)\.dll$' }
+                Copy-Item $WhisperCli $vkDir -Force     # last, so a half-finished install is not mistaken for a complete one
+                Remove-Item $DeviceCacheFile -ErrorAction SilentlyContinue
+            }
+            catch { Write-Warning "GPU backend could not be installed ($($_.Exception.Message)); using CPU only." }
         }
         if ($Update -or -not (Test-Path $MkvPropEdit)) {
             Write-Host 'Installing mkvpropedit (MKVToolNix) ...' -ForegroundColor Cyan
@@ -557,6 +574,82 @@ function Get-TrackLanguage([string]$File, $Track, [string]$TempDir) {
     $best | Add-Member -NotePropertyName Model -NotePropertyValue $model -PassThru
 }
 
+# ---------------------------------------------------------------------------------------------
+#  Device selection: CPU vs. each Vulkan GPU, benchmarked once per machine and model, cached
+# ---------------------------------------------------------------------------------------------
+$script:Runners = @{}
+$CpuRunner = [pscustomobject]@{ Exe = $WhisperCli; Args = @(); Label = 'CPU' }
+
+function Get-MachineKey {
+    $gpus = ''
+    try { $gpus = (Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }) -join ',' } catch {}
+    return "$env:COMPUTERNAME|$gpus"
+}
+
+function Measure-Runner([string]$Exe, [string[]]$ExtraArgs, [string]$ModelPath, [string]$WorkDir) {
+    $wargs = @('-m', $ModelPath, '-dl', '-l', 'auto', '-t', "$Threads", '-f', 'bench.wav', '-f', 'bench.wav') + $ExtraArgs
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-Tool $Exe $wargs $WorkDir
+    $sec = $sw.Elapsed.TotalSeconds
+    $text = $r.Err + "`n" + $r.Out
+    $ok = $r.ExitCode -eq 0 -and ([regex]::Matches($text, 'auto-detected language:')).Count -eq 2
+    [pscustomobject]@{ Ok = $ok; Seconds = $sec; Text = $text }
+}
+
+function Get-WhisperRunner([string]$ModelPath) {
+    if ($script:Runners.ContainsKey($ModelPath)) { return $script:Runners[$ModelPath] }
+    $runner = $CpuRunner
+    if ($Device -ne 'Cpu' -and (Test-Path $WhisperVkCli)) {
+        $key = (Get-MachineKey) + '|' + (Split-Path $ModelPath -Leaf)
+        $cache = @{}
+        try {
+            if (Test-Path $DeviceCacheFile) {
+                $j = Get-Content -Raw -LiteralPath $DeviceCacheFile | ConvertFrom-Json
+                foreach ($p in $j.PSObject.Properties) { $cache[$p.Name] = $p.Value }
+            }
+        } catch {}
+        $hit = if ($Device -eq 'Auto') { $cache[$key] } else { $null }
+        if ($hit) {
+            if ($hit.Kind -eq 'vulkan') { $runner = [pscustomobject]@{ Exe = $WhisperVkCli; Args = @('-dev', "$($hit.Dev)"); Label = $hit.Label } }
+        }
+        else {
+            Write-Host "  Benchmarking CPU/GPU for $(Split-Path $ModelPath -Leaf) (one-time on this machine) ..." -ForegroundColor DarkGray
+            $r = Invoke-Tool $Ffmpeg @('-hide_banner', '-nostdin', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i',
+                'anoisesrc=color=pink:amplitude=0.1:duration=30', '-ar', '16000', '-ac', '1', 'bench.wav') $TempDir
+            $results = @()
+            if ($Device -eq 'Auto') {
+                $m = Measure-Runner $WhisperCli @() $ModelPath $TempDir
+                if ($m.Ok) { $results += [pscustomobject]@{ Kind = 'cpu'; Dev = -1; Label = 'CPU'; Seconds = $m.Seconds } }
+            }
+            # discover Vulkan devices with a first run on device 0
+            $m = Measure-Runner $WhisperVkCli @('-dev', '0') $ModelPath $TempDir
+            $names = @{}
+            foreach ($x in [regex]::Matches($m.Text, 'ggml_vulkan:\s*(\d+)\s*=\s*([^|\r\n]+?)\s*(\(|\|)')) { $names[[int]$x.Groups[1].Value] = $x.Groups[2].Value.Trim() }
+            for ($i = 0; $i -lt [Math]::Max(1, $names.Count); $i++) {
+                if ($i -gt 0) { $m = Measure-Runner $WhisperVkCli @('-dev', "$i") $ModelPath $TempDir }
+                if ($m.Ok -and $m.Text -match "using Vulkan$i backend") {
+                    $label = if ($names[$i]) { "$($names[$i]) (Vulkan)" } else { "Vulkan$i" }
+                    $results += [pscustomobject]@{ Kind = 'vulkan'; Dev = $i; Label = $label; Seconds = $m.Seconds }
+                }
+            }
+            Remove-Item -LiteralPath (Join-Path $TempDir 'bench.wav') -ErrorAction SilentlyContinue
+            $summary = ($results | ForEach-Object { '{0} {1:N1}s' -f $_.Label, $_.Seconds }) -join ', '
+            if (-not $summary) { $summary = 'no GPU usable' }
+            $best = $results | Sort-Object Seconds | Select-Object -First 1
+            if ($best -and $best.Kind -eq 'vulkan') {
+                $runner = [pscustomobject]@{ Exe = $WhisperVkCli; Args = @('-dev', "$($best.Dev)"); Label = $best.Label }
+            }
+            Write-Host "  -> using $($runner.Label)  [$summary]" -ForegroundColor DarkGray
+            if ($Device -eq 'Auto' -and $best) {
+                $cache[$key] = [pscustomobject]@{ Kind = $best.Kind; Dev = $best.Dev; Label = $best.Label; Benchmark = $summary }
+                try { ([pscustomobject]$cache) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $DeviceCacheFile -Encoding UTF8 } catch {}
+            }
+        }
+    }
+    $script:Runners[$ModelPath] = $runner
+    return $runner
+}
+
 # Runs whisper language detection on excerpts (relative names inside $WorkDir). Returns { Lang; P } per excerpt with speech.
 function Invoke-LanguageDetect([string]$ModelPath, $Wavs, [string]$WorkDir) {
     $out = New-Object System.Collections.Generic.List[object]
@@ -564,7 +657,14 @@ function Invoke-LanguageDetect([string]$ModelPath, $Wavs, [string]$WorkDir) {
     # VAD: excerpts without speech (music, effects, noise) yield no detection instead of a bogus language
     $wargs = @('-m', $ModelPath, '-dl', '-l', 'auto', '-t', "$Threads", '--vad', '--vad-model', $VadModelFile)
     foreach ($w in $Wavs) { $wargs += @('-f', $w) }
-    $r = Invoke-Tool $WhisperCli $wargs $WorkDir
+    $runner = Get-WhisperRunner $ModelPath
+    $r = Invoke-Tool $runner.Exe ($wargs + $runner.Args) $WorkDir
+    if ($runner.Exe -ne $WhisperCli -and ($r.ExitCode -ne 0 -or $r.Err -notmatch 'auto-detected language|speech segments')) {
+        # GPU run failed (driver issue etc.) - fall back to CPU for the rest of this session
+        Write-Host " (GPU failed, falling back to CPU)" -NoNewline -ForegroundColor Yellow
+        $script:Runners[$ModelPath] = $CpuRunner
+        $r = Invoke-Tool $WhisperCli $wargs $WorkDir
+    }
     foreach ($m in [regex]::Matches($r.Err + "`n" + $r.Out, 'auto-detected language:\s*(\w+)\s*\(p\s*=\s*([\d.]+)\)')) {
         $out.Add([pscustomobject]@{ Lang = $m.Groups[1].Value; P = [double]::Parse($m.Groups[2].Value, [Globalization.CultureInfo]::InvariantCulture) })
     }
@@ -662,6 +762,15 @@ $TempDir = Join-Path ([IO.Path]::GetTempPath()) ('AudiotrackID-' + [guid]::NewGu
 New-Item -ItemType Directory -Force $TempDir | Out-Null
 $rows = New-Object System.Collections.Generic.List[object]
 $mode = if ($DryRun) { ' (dry run)' } else { '' }
+
+# pick CPU/GPU up front (benchmark output would otherwise interrupt a track's line)
+try {
+    $rm = Get-WhisperRunner $ModelFile
+    $msg = "Whisper device: $($rm.Label) ($Model)"
+    if ($VerifyModel) { $rv = Get-WhisperRunner $VerifyModelFile; $msg += ", $($rv.Label) ($VerifyModel)" }
+    Write-Host $msg -ForegroundColor Cyan
+}
+catch { Write-Warning "Device selection failed ($($_.Exception.Message)); using CPU." }
 Write-Host "Found $($files.Count) video file(s). Scanning tracks ..." -ForegroundColor Cyan
 
 # --- pass 1: probe all files (fast) ------------------------------------------------------------
