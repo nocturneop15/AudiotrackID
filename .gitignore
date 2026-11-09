@@ -1,0 +1,7 @@
+# Downloaded on first run (ffmpeg, whisper.cpp, mkvpropedit, models) - ~1.4 GB
+tools/
+
+# Reports and leftovers
+*.csv
+*.atid-tmp.*
+*.atid-bak
