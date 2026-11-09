@@ -558,9 +558,11 @@ function Get-TrackLanguage([string]$File, $Track, [string]$TempDir) {
         # Second opinion: re-check the same excerpts with the large model when the fast one is not sure.
         $best = Get-VoteResult $results
         $model = $Model
+        $rechecked = 0
         if ($VerifyModel -and $best -and $best.Confidence -lt $VerifyBelow) {
             $nm = if ($Languages[$best.Lang]) { $Languages[$best.Lang].Name } else { $best.Lang }
             Write-Host (" {0}? {1:P0}, verifying with {2} ..." -f $nm, $best.Confidence, $VerifyModel) -NoNewline -ForegroundColor DarkGray
+            $rechecked = $allWavs.Count
             $verified = Invoke-LanguageDetect $VerifyModelFile $allWavs $TempDir
             if ($verified.Count -gt 0) { $results = $verified; $model = $VerifyModel }
         }
@@ -569,8 +571,10 @@ function Get-TrackLanguage([string]$File, $Track, [string]$TempDir) {
 
     $best = Get-VoteResult $results
     if ($best -and $results.Count -lt $MinSpeechSamples) { $best.Confidence = 0.0 }   # too little speech to trust
-    if (-not $best) { return [pscustomobject]@{ Lang = $null; Confidence = 0.0; Votes = 0; Total = 0; Sampled = $taken; Model = $Model } }
-    $best | Add-Member -NotePropertyName Sampled -NotePropertyValue $taken
+    # Sampled = excerpts with sound that went through Whisper; Rechecked = how many of them the verify model re-ran
+    if (-not $best) { return [pscustomobject]@{ Lang = $null; Confidence = 0.0; Votes = 0; Total = 0; Sampled = $allWavs.Count; Rechecked = $rechecked; Model = $Model } }
+    $best | Add-Member -NotePropertyName Sampled -NotePropertyValue $allWavs.Count
+    $best | Add-Member -NotePropertyName Rechecked -NotePropertyValue $rechecked
     $best | Add-Member -NotePropertyName Model -NotePropertyValue $model -PassThru
 }
 
@@ -812,16 +816,27 @@ Write-Host "Model: $Model, $Samples x ${SampleSeconds}s samples per track; $($ho
 
 function New-Row($file, $t) {
     [pscustomobject]@{ File = $file; Track = "a$($t.AudioIndex + 1)"; OldTitle = $t.Title; OldLanguage = $t.Language
-        Source = ''; Detected = ''; Confidence = ''; Votes = ''; NewTitle = ''; Status = '' }
+        Source = ''; Detected = ''; Confidence = ''; Votes = ''; Samples = ''; NewTitle = ''; Status = '' }
 }
 
-# --- pass 2: identify and rename ------------------------------------------------------------------
+function Format-Duration([double]$Seconds) {
+    if ($Seconds -lt 60) { return ('{0:N1} s' -f $Seconds) }
+    $ts = [TimeSpan]::FromSeconds($Seconds)
+    if ($ts.TotalHours -ge 1) { return ('{0}h {1:00}m {2:00}s' -f [int][Math]::Floor($ts.TotalHours), $ts.Minutes, $ts.Seconds) }
+    return ('{0}m {1:00}s' -f $ts.Minutes, $ts.Seconds)
+}
+
+# --- identify and rename, file by file -----------------------------------------------------------
+$totalSw = [Diagnostics.Stopwatch]::StartNew()
+$totalSamples = 0; $totalRechecked = 0
 try {
     $n = 0
     foreach ($file in $files) {
         $n++
         Write-Host ''
         Write-Host "[$n/$($files.Count)] $file" -ForegroundColor White
+        $fileSw = [Diagnostics.Stopwatch]::StartNew()
+        $fileSamples = 0; $fileRechecked = 0
         try {
             $tracks = @(Get-AudioTracks $file)
             if ($tracks.Count -eq 0) { Write-Host '   no audio tracks' -ForegroundColor DarkGray; continue }
@@ -857,6 +872,8 @@ try {
                 if ($source -eq 'whisper') {
                     Write-Host "   $desc $shown - detecting ..." -NoNewline
                     $res = Get-TrackLanguage $file $t $TempDir
+                    $fileSamples += $res.Sampled; $fileRechecked += $res.Rechecked
+                    $row.Samples = if ($res.Rechecked) { "$($res.Sampled)+$($res.Rechecked)" } else { "$($res.Sampled)" }
                     $row.Detected = $res.Lang; $row.Confidence = [Math]::Round($res.Confidence, 3); $row.Votes = "$($res.Votes)/$($res.Total)"
                     if (-not $res.Lang) {
                         Write-Host ' no speech found' -ForegroundColor Yellow
@@ -920,6 +937,13 @@ try {
             $er.Track = ''; $er.Status = "error: $($_.Exception.Message)"
             $rows.Add($er)
         }
+        finally {
+            # per-file stats: Whisper samples and elapsed time (also printed when the file was skipped)
+            $totalSamples += $fileSamples; $totalRechecked += $fileRechecked
+            $stat = if ($fileSamples -eq 0) { 'no Whisper samples' } else { "$fileSamples Whisper sample(s)" }
+            if ($fileRechecked) { $stat += " + $fileRechecked re-checked with $VerifyModel" }
+            Write-Host "   $stat, $(Format-Duration $fileSw.Elapsed.TotalSeconds)" -ForegroundColor DarkGray
+        }
     }
 }
 finally {
@@ -928,6 +952,9 @@ finally {
 
 Write-Host ''
 Write-Host 'Summary' -ForegroundColor Cyan
+$totStat = "$totalSamples Whisper sample(s)"
+if ($totalRechecked) { $totStat += " + $totalRechecked re-checked" }
+Write-Host "  $($files.Count) file(s), $totStat, $(Format-Duration $totalSw.Elapsed.TotalSeconds)"
 if ($rows.Count -gt 0) {
     $rows | Group-Object Status | ForEach-Object { Write-Host ("  {0,-14} {1}" -f $_.Name, $_.Count) }
 }
