@@ -588,6 +588,9 @@ function Get-MachineKey {
 
 function Measure-Runner([string]$Exe, [string[]]$ExtraArgs, [string]$ModelPath, [string]$WorkDir) {
     $wargs = @('-m', $ModelPath, '-dl', '-l', 'auto', '-t', "$Threads", '-f', 'bench.wav', '-f', 'bench.wav') + $ExtraArgs
+    # untimed warm-up: the first start pays one-off costs (antivirus scan of fresh DLLs, GPU shader
+    # compilation, cold disk cache) that would otherwise make the first candidate look slow
+    [void](Invoke-Tool $Exe $wargs $WorkDir)
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $r = Invoke-Tool $Exe $wargs $WorkDir
     $sec = $sw.Elapsed.TotalSeconds
@@ -600,7 +603,8 @@ function Get-WhisperRunner([string]$ModelPath) {
     if ($script:Runners.ContainsKey($ModelPath)) { return $script:Runners[$ModelPath] }
     $runner = $CpuRunner
     if ($Device -ne 'Cpu' -and (Test-Path $WhisperVkCli)) {
-        $key = (Get-MachineKey) + '|' + (Split-Path $ModelPath -Leaf)
+        # 'v2': benchmarks with warm-up; results cached by older versions are ignored and re-measured
+        $key = 'v2|' + (Get-MachineKey) + '|' + (Split-Path $ModelPath -Leaf)
         $cache = @{}
         try {
             if (Test-Path $DeviceCacheFile) {
@@ -759,6 +763,7 @@ Install-Tools
 $HaveMkvPropEdit = Test-Path $MkvPropEdit
 $MinSpeechSamples = [Math]::Min(2, $Samples)
 
+Write-Host 'Searching for video files ...' -ForegroundColor Cyan
 $files = New-Object System.Collections.Generic.List[string]
 foreach ($p in $Path) {
     if (Test-Path -LiteralPath $p -PathType Container) {
@@ -784,32 +789,19 @@ try {
     Write-Host $msg -ForegroundColor Cyan
 }
 catch { Write-Warning "Device selection failed ($($_.Exception.Message)); using CPU." }
-Write-Host "Found $($files.Count) video file(s). Scanning tracks ..." -ForegroundColor Cyan
+Write-Host "Found $($files.Count) video file(s)." -ForegroundColor Cyan
 
-# --- pass 1: probe all files (fast) ------------------------------------------------------------
-$scan = New-Object System.Collections.Generic.List[object]
-$tagOnly = 0
-foreach ($file in $files) {
-    try {
-        $tracks = @(Get-AudioTracks $file)
-        foreach ($t in $tracks) {
-            if (-not (Test-TitleHasLanguage $t.Title) -and (Resolve-TagLanguage $t.Language)) { $tagOnly++ }
-        }
-        $scan.Add([pscustomobject]@{ File = $file; Tracks = $tracks; Error = $null })
-    }
-    catch { $scan.Add([pscustomobject]@{ File = $file; Tracks = @(); Error = $_.Exception.Message }) }
+# Offer the quick path (trust existing language tags) the first time it applies, unless decided on the command line.
+$script:AskTagQuickPath = -not $Force -and -not $PSBoundParameters.ContainsKey('UseLanguageTag')
+if ($script:AskTagQuickPath) {
+    try { if ([Console]::IsInputRedirected -or -not [Environment]::UserInteractive) { $script:AskTagQuickPath = $false } } catch { $script:AskTagQuickPath = $false }
 }
-
-# Offer the quick path (trust existing language tags) when it applies and wasn't decided on the command line.
-if ($tagOnly -gt 0 -and -not $Force -and -not $PSBoundParameters.ContainsKey('UseLanguageTag')) {
-    $interactive = [Environment]::UserInteractive
-    try { if ([Console]::IsInputRedirected) { $interactive = $false } } catch {}
-    if ($interactive) {
-        Write-Host ''
-        Write-Host "$tagOnly track(s) have no language in the title but already carry a language tag (e.g. 'cze')." -ForegroundColor Yellow
-        $answer = Read-Host 'Quick path: name them from the tag instead of running Whisper? [y/N]'
-        if ($answer -match '^\s*(y|yes|a|ano)\s*$') { $UseLanguageTag = [switch]$true }
-    }
+function Confirm-TagQuickPath([string]$Track, [string]$Tag) {
+    if (-not $script:AskTagQuickPath) { return }
+    $script:AskTagQuickPath = $false
+    Write-Host "   $Track has no language in its title but carries the language tag '$Tag'." -ForegroundColor Yellow
+    $answer = Read-Host '   Quick path for this and all following such tracks: name them from the tag instead of running Whisper? [y/N]'
+    if ($answer -match '^\s*(y|yes|a|ano)\s*$') { $script:UseLanguageTag = [switch]$true }
 }
 
 $how = @("names: $NameFormat")
@@ -826,14 +818,12 @@ function New-Row($file, $t) {
 # --- pass 2: identify and rename ------------------------------------------------------------------
 try {
     $n = 0
-    foreach ($entry in $scan) {
+    foreach ($file in $files) {
         $n++
-        $file = $entry.File
         Write-Host ''
-        Write-Host "[$n/$($scan.Count)] $file" -ForegroundColor White
+        Write-Host "[$n/$($files.Count)] $file" -ForegroundColor White
         try {
-            if ($entry.Error) { throw $entry.Error }
-            $tracks = @($entry.Tracks)
+            $tracks = @(Get-AudioTracks $file)
             if ($tracks.Count -eq 0) { Write-Host '   no audio tracks' -ForegroundColor DarkGray; continue }
             $changes = New-Object System.Collections.Generic.List[object]
 
@@ -858,7 +848,10 @@ try {
                     }
                     $source = 'title'; $code = $titleCodes[0]
                 }
-                elseif (-not $Force -and $UseLanguageTag -and $tagCode) { $source = 'tag'; $code = $tagCode }
+                elseif (-not $Force -and $tagCode) {
+                    if (-not $UseLanguageTag) { Confirm-TagQuickPath "$desc $shown" $t.Language }
+                    if ($UseLanguageTag) { $source = 'tag'; $code = $tagCode }
+                }
                 $row.Source = $source
 
                 if ($source -eq 'whisper') {
