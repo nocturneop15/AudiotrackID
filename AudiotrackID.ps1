@@ -44,8 +44,12 @@ param(
     # the fastest (cached in tools\device-cache.json); Gpu = fastest GPU without the CPU comparison.
     [ValidateSet('Auto', 'Cpu', 'Gpu')][string]$Device = 'Auto',
 
-    # Number of random excerpts per track (a second round is taken if the result is unclear).
+    # Number of random excerpts per round (a second round is always taken if the result is unclear).
     [ValidateRange(1, 50)][int]$Samples = 6,
+
+    # Maximum seconds spent analysing one audio track. While the language is still unclear after
+    # two rounds, further rounds of fresh excerpts are taken until this time is used up.
+    [ValidateRange(0, 86400)][int]$MaxTime = 120,
 
     # Seconds of (silence-stripped) audio per excerpt. Whisper looks at max 30 s.
     [ValidateRange(5, 30)][int]$SampleSeconds = 30,
@@ -518,6 +522,21 @@ function Get-TrackLanguage([string]$File, $Track, [string]$TempDir) {
     $taken = 0
     $useCenter = ($Track.Channels -as [int]) -ge 3     # surround: dialogue lives in the center channel
 
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $curModel = $Model; $curModelFile = $ModelFile
+    $rechecked = 0
+
+    # Switches to the -VerifyModel second opinion: re-checks every excerpt taken so far with it;
+    # any further rounds then use it directly. Dot-sourced, so it works on this function's variables.
+    $verify = {
+        $nm = if ($Languages[$best.Lang]) { $Languages[$best.Lang].Name } else { $best.Lang }
+        Write-Host (" {0}? {1:P0}, verifying with {2} ..." -f $nm, $best.Confidence, $VerifyModel) -NoNewline -ForegroundColor DarkGray
+        $rechecked = $allWavs.Count
+        $verified = Invoke-LanguageDetect $VerifyModelFile $allWavs $TempDir
+        $curModel = $VerifyModel; $curModelFile = $VerifyModelFile
+        $results = $verified
+    }
+
     try {
         $maxRounds = 2
         for ($round = 1; $round -le $maxRounds; $round++) {
@@ -541,10 +560,12 @@ function Get-TrackLanguage([string]$File, $Track, [string]$TempDir) {
                 $full = Join-Path $TempDir $wav
                 if ($r.ExitCode -eq 0 -and (Test-Path $full) -and (Get-Item $full).Length -ge $minBytes) { $wavs.Add($wav); $allWavs.Add($wav) }
             }
-            foreach ($x in (Invoke-LanguageDetect $ModelFile $wavs $TempDir)) { $results.Add($x) }
+            $new = Invoke-LanguageDetect $curModelFile $wavs $TempDir
+            foreach ($x in $new) { $results.Add($x) }
 
             $best = Get-VoteResult $results
-            if ($best -and $best.Confidence -ge $MinConfidence -and $results.Count -ge $MinSpeechSamples) { break }
+            $clear = $best -and $best.Confidence -ge $MinConfidence -and $results.Count -ge $MinSpeechSamples
+            if ($clear) { break }
             if ($useCenter -and $results.Count -lt $MinSpeechSamples) {
                 # center channel silent/empty (fake or odd 5.1) - sample the full mix instead
                 Write-Host ' center channel has no speech, using full mix ...' -NoNewline -ForegroundColor DarkGray
@@ -552,19 +573,27 @@ function Get-TrackLanguage([string]$File, $Track, [string]$TempDir) {
                 if ($round -eq $maxRounds) { $maxRounds++ }
                 continue
             }
-            if ($round -lt $maxRounds) { Write-Host ' unclear, more samples ...' -NoNewline -ForegroundColor DarkGray }
+            # still unclear after the regular rounds: keep going while there is time left
+            if ($round -eq $maxRounds -and $sw.Elapsed.TotalSeconds -lt $MaxTime) {
+                if ($results.Count -eq 0 -and $taken -ge 3 * $Samples) { break }   # no speech at all, give up
+                # the small model keeps wavering: let the large one judge what we have before sampling more
+                if ($VerifyModel -and $curModel -eq $Model -and $best) {
+                    . $verify
+                    $best = Get-VoteResult $results
+                    if ($best -and $best.Confidence -ge $MinConfidence -and $results.Count -ge $MinSpeechSamples) { break }
+                    if ($sw.Elapsed.TotalSeconds -ge $MaxTime) { break }
+                }
+                $maxRounds++
+            }
+            if ($round -lt $maxRounds) { Write-Host " unclear, more samples ($([int]$sw.Elapsed.TotalSeconds)/$MaxTime s) ..." -NoNewline -ForegroundColor DarkGray }
         }
 
         # Second opinion: re-check the same excerpts with the large model when the fast one is not sure.
         $best = Get-VoteResult $results
-        $model = $Model
-        $rechecked = 0
-        if ($VerifyModel -and $best -and $best.Confidence -lt $VerifyBelow) {
-            $nm = if ($Languages[$best.Lang]) { $Languages[$best.Lang].Name } else { $best.Lang }
-            Write-Host (" {0}? {1:P0}, verifying with {2} ..." -f $nm, $best.Confidence, $VerifyModel) -NoNewline -ForegroundColor DarkGray
-            $rechecked = $allWavs.Count
-            $verified = Invoke-LanguageDetect $VerifyModelFile $allWavs $TempDir
-            if ($verified.Count -gt 0) { $results = $verified; $model = $VerifyModel }
+        if ($VerifyModel -and $curModel -eq $Model -and $best -and $best.Confidence -lt $VerifyBelow) {
+            $before = $results
+            . $verify
+            if ($results.Count -eq 0) { $results = $before; $curModel = $Model }
         }
     }
     finally { Get-ChildItem -LiteralPath $TempDir -Filter '*.wav' | Remove-Item -Force }
@@ -575,7 +604,7 @@ function Get-TrackLanguage([string]$File, $Track, [string]$TempDir) {
     if (-not $best) { return [pscustomobject]@{ Lang = $null; Confidence = 0.0; Votes = 0; Total = 0; Sampled = $allWavs.Count; Rechecked = $rechecked; Model = $Model } }
     $best | Add-Member -NotePropertyName Sampled -NotePropertyValue $allWavs.Count
     $best | Add-Member -NotePropertyName Rechecked -NotePropertyValue $rechecked
-    $best | Add-Member -NotePropertyName Model -NotePropertyValue $model -PassThru
+    $best | Add-Member -NotePropertyName Model -NotePropertyValue $curModel -PassThru
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -812,7 +841,7 @@ $how = @("names: $NameFormat")
 if ($Normalize) { $how += 'normalize named tracks' }
 if ($UseLanguageTag) { $how += 'trust language tags' }
 if ($Force) { $how += 'Whisper on all tracks' }
-Write-Host "Model: $Model, $Samples x ${SampleSeconds}s samples per track; $($how -join ', ')$mode" -ForegroundColor Cyan
+Write-Host "Model: $Model, $Samples x ${SampleSeconds}s samples per round, max ${MaxTime}s per track; $($how -join ', ')$mode" -ForegroundColor Cyan
 
 function New-Row($file, $t) {
     [pscustomobject]@{ File = $file; Track = "a$($t.AudioIndex + 1)"; OldTitle = $t.Title; OldLanguage = $t.Language
@@ -883,7 +912,7 @@ try {
                     $pct = '{0:P0}' -f $res.Confidence
                     $langName = if ($Languages[$code]) { $Languages[$code].Name } else { $code }
                     if ($res.Confidence -lt $MinConfidence) {
-                        Write-Host " $langName? $pct ($($res.Votes)/$($res.Total)) - too uncertain, left unchanged" -ForegroundColor Yellow
+                        Write-Host " ${langName}? $pct ($($res.Votes)/$($res.Total)) - too uncertain, left unchanged" -ForegroundColor Yellow
                         $row.Status = 'uncertain'; $rows.Add($row); continue
                     }
                     $via = if ($res.Model -ne $Model) { ", $($res.Model)" } else { '' }

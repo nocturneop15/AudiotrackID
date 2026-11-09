@@ -44,7 +44,8 @@ AudiotrackID.cmd -Setup                      # download/update all tools (for of
 | `-Device` | `Auto` | `Auto` benchmarks the CPU and every GPU once per machine and model, then uses the fastest. `Gpu` uses the fastest GPU, `Cpu` never uses a GPU |
 | `-VerifyModel` | `large-v3-turbo-q5_0` | second opinion: when `-Model` is under `-VerifyBelow`, the same excerpts are re-checked with this larger model. It is far better with accents (e.g. Scottish English) but ~5× slower on CPU. `''` disables it |
 | `-VerifyBelow` | `0.9` | confidence under which the second opinion is requested |
-| `-Samples` | `6` | random excerpts per track (a 2nd round is taken automatically if unclear) |
+| `-Samples` | `6` | random excerpts per round (a 2nd round is taken automatically if unclear) |
+| `-MaxTime` | `120` | seconds one track may take. If the language is still unclear after two rounds, it is re-checked with `-VerifyModel` and further rounds of fresh excerpts are taken until it is clear or the time is up. `0` = two rounds only |
 | `-SampleSeconds` | `30` | seconds of audio per excerpt (Whisper uses at most 30) |
 | `-MinConfidence` | `0.6` | below this the track is reported as uncertain and left unchanged |
 | `-DryRun` | | detect only, don't write |
@@ -68,6 +69,8 @@ AudiotrackID.cmd -Setup                      # download/update all tools (for of
 3. `whisper-cli` (whisper.cpp) runs language detection on the excerpts with Silero VAD, so excerpts
    with only music, effects or noise don't count. Results are combined as votes weighted by probability.
    If the fast `small` model is under 90 % sure, the same excerpts are re-checked with `large-v3-turbo`.
+   If two rounds are still not enough, more rounds of new excerpts follow (with `large-v3-turbo`)
+   until the result is clear or `-MaxTime` is reached.
 4. If the result is confident enough, the language tag (ISO 639-2) and title are written:
    * **MKV / WebM / MKA**: in place with `mkvpropedit` (instant, no rewrite)
    * **MP4 / MOV / AVI / TS / ...**: lossless `ffmpeg -c copy` remux to a temp file. It is checked,
