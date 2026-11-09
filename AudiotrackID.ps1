@@ -729,6 +729,218 @@ function Set-TracksMkv([string]$File, $Changes) {
     if ($r.ExitCode -ge 2) { throw "mkvpropedit failed: $(($r.Out + $r.Err).Trim())" }
 }
 
+# MP4 / MOV: language (mdhd) and track name (hdlr, udta/name) live in the 'moov' header box, which
+# is only a few hundred KB. It is rebuilt in memory and written back without touching the media data:
+#  * the new header fits where the old one was (plus any following 'free' padding) -> overwritten in place
+#  * the header is at the end of the file -> rewritten there, file length adjusted
+#  * otherwise the old header is turned into a 'free' box and the new one appended at the end of the
+#    file. Sample offsets point into 'mdat', which never moves, so they stay valid.
+# Anything unusual (fragmented MP4, damaged boxes) throws NotSupportedException -> caller remuxes.
+$Mp4PatcherSource = @'
+using System;
+using System.IO;
+using System.Text;
+using System.Collections.Generic;
+
+public class AtidMp4Undo { public long Length; public long Offset; public byte[] Bytes; public string Mode; }
+
+public static class AtidMp4 {
+    class Box { public string Type; public byte[] Raw; public List<Box> Kids; public byte[] Tail; public byte[] Payload; }
+
+    static readonly HashSet<string> Containers = new HashSet<string>(new[] { "moov", "trak", "mdia", "udta" });
+    static readonly HashSet<string> Leaves = new HashSet<string>(new[] { "mdhd", "hdlr", "name" });
+
+    static uint U32(byte[] b, int o) { return (uint)(b[o] << 24 | b[o + 1] << 16 | b[o + 2] << 8 | b[o + 3]); }
+    static ulong U64(byte[] b, int o) { return ((ulong)U32(b, o) << 32) | U32(b, o + 4); }
+    static string Fourcc(byte[] b, int o) { return Encoding.ASCII.GetString(b, o, 4); }
+    static void Put32(byte[] b, int o, uint v) { b[o] = (byte)(v >> 24); b[o + 1] = (byte)(v >> 16); b[o + 2] = (byte)(v >> 8); b[o + 3] = (byte)v; }
+
+    static List<Box> Parse(byte[] b, int start, int end, out byte[] tail) {
+        var list = new List<Box>();
+        int p = start;
+        while (p + 8 <= end) {
+            long size = U32(b, p); int hdr = 8;
+            if (size == 1) { if (p + 16 > end) break; size = (long)U64(b, p + 8); hdr = 16; }
+            if (size < hdr || p + size > end) break;          // size 0 / garbage / QuickTime terminator -> keep as tail
+            int s = (int)size;
+            var x = new Box(); x.Type = Fourcc(b, p + 4);
+            if (hdr == 8 && Containers.Contains(x.Type)) { byte[] t; x.Kids = Parse(b, p + 8, p + s, out t); x.Tail = t; }
+            else if (hdr == 8 && Leaves.Contains(x.Type)) { x.Payload = new byte[s - 8]; Buffer.BlockCopy(b, p + 8, x.Payload, 0, s - 8); }
+            else { x.Raw = new byte[s]; Buffer.BlockCopy(b, p, x.Raw, 0, s); }
+            list.Add(x);
+            p += s;
+        }
+        tail = new byte[end - p];
+        Buffer.BlockCopy(b, p, tail, 0, end - p);
+        return list;
+    }
+
+    static byte[] Serialize(Box x) {
+        if (x.Raw != null) return x.Raw;
+        var ms = new MemoryStream();
+        ms.Write(new byte[8], 0, 8);
+        if (x.Kids != null) { foreach (var k in x.Kids) { var kb = Serialize(k); ms.Write(kb, 0, kb.Length); } ms.Write(x.Tail, 0, x.Tail.Length); }
+        else ms.Write(x.Payload, 0, x.Payload.Length);
+        var r = ms.ToArray();
+        Put32(r, 0, (uint)r.Length);
+        Encoding.ASCII.GetBytes(x.Type, 0, 4, r, 4);
+        return r;
+    }
+
+    static Box Kid(Box parent, string type) {
+        if (parent == null || parent.Kids == null) return null;
+        foreach (var k in parent.Kids) if (k.Type == type) return k;
+        return null;
+    }
+
+    static byte[] ReadAt(FileStream fs, long pos, int count) {
+        var b = new byte[count]; fs.Position = pos; int got = 0;
+        while (got < count) { int n = fs.Read(b, got, count - got); if (n <= 0) throw new EndOfStreamException(); got += n; }
+        return b;
+    }
+
+    static void WriteAt(FileStream fs, long pos, byte[] b) { fs.Position = pos; fs.Write(b, 0, b.Length); }
+
+    // trakIndex = container stream index (ffprobe numbers streams in trak order)
+    public static AtidMp4Undo Patch(string path, int[] trakIndex, string[] langs, string[] titles) {
+        using (var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.Read)) {
+            long len = fs.Length, pos = 0, moovPos = -1, moovSize = 0, avail = 0;
+            bool fragmented = false, openEnded = false, isom = false, afterMoov = false, onlyFreeAfter = true;
+            while (pos + 8 <= len) {
+                var h = ReadAt(fs, pos, (int)Math.Min(16, len - pos));
+                long size = U32(h, 0); string type = Fourcc(h, 4);
+                if (size == 1) { if (h.Length < 16) throw new NotSupportedException("damaged box header"); size = (long)U64(h, 8); }
+                else if (size == 0) { size = len - pos; openEnded = true; }
+                if (size < 8 || pos + size > len) throw new NotSupportedException("damaged or truncated file");
+                if (type == "ftyp" && size >= 12) isom = Fourcc(ReadAt(fs, pos + 8, 4), 0) != "qt  ";
+                if (type == "moof") fragmented = true;
+                if (type == "moov") {
+                    if (moovPos >= 0) throw new NotSupportedException("several moov boxes");
+                    moovPos = pos; moovSize = size; avail = size; afterMoov = true;
+                }
+                else if (afterMoov) {
+                    if ((type == "free" || type == "skip") && onlyFreeAfter && moovPos + avail == pos) avail += size;
+                    else onlyFreeAfter = false;
+                }
+                pos += size;
+            }
+            if (moovPos < 0) throw new NotSupportedException("no moov box");
+            if (moovSize > 512L * 1024 * 1024) throw new NotSupportedException("moov box too large");
+
+            var raw = ReadAt(fs, moovPos, (int)moovSize);
+            int mh = U32(raw, 0) == 1 ? 16 : 8;
+            byte[] tail;
+            var moov = new Box(); moov.Type = "moov"; moov.Kids = Parse(raw, mh, raw.Length, out tail); moov.Tail = tail;
+            if (Kid(moov, "mvex") != null) fragmented = true;
+            var traks = moov.Kids.FindAll(k => k.Type == "trak");
+
+            for (int i = 0; i < trakIndex.Length; i++) {
+                if (trakIndex[i] < 0 || trakIndex[i] >= traks.Count) throw new NotSupportedException("track " + trakIndex[i] + " not found");
+                var trak = traks[trakIndex[i]];
+                var mdia = Kid(trak, "mdia");
+                var hdlr = Kid(mdia, "hdlr"); var mdhd = Kid(mdia, "mdhd");
+                if (hdlr == null || mdhd == null || hdlr.Payload == null || mdhd.Payload == null || hdlr.Payload.Length < 24)
+                    throw new NotSupportedException("unexpected track structure");
+                if (Fourcc(hdlr.Payload, 8) != "soun") throw new NotSupportedException("track " + trakIndex[i] + " is not audio");
+
+                // language: 3 x 5 bits, each letter - 0x60
+                string l = langs[i];
+                if (l == null || l.Length != 3 || l.ToLowerInvariant() != l) throw new NotSupportedException("bad language code " + l);
+                foreach (char c in l) if (c < 'a' || c > 'z') throw new NotSupportedException("bad language code " + l);
+                int lo = mdhd.Payload[0] == 1 ? 32 : 20;
+                if (mdhd.Payload.Length < lo + 2) throw new NotSupportedException("short mdhd");
+                int packed = ((l[0] - 0x60) << 10) | ((l[1] - 0x60) << 5) | (l[2] - 0x60);
+                mdhd.Payload[lo] = (byte)(packed >> 8); mdhd.Payload[lo + 1] = (byte)packed;
+
+                // handler name: ISO = UTF-8 + NUL, QuickTime = Pascal string
+                byte[] name = Encoding.UTF8.GetBytes(titles[i]);
+                var ms = new MemoryStream();
+                ms.Write(hdlr.Payload, 0, 24);
+                if (isom) { ms.Write(name, 0, name.Length); ms.WriteByte(0); }
+                else { int n = Math.Min(name.Length, 255); ms.WriteByte((byte)n); ms.Write(name, 0, n); }
+                hdlr.Payload = ms.ToArray();
+
+                var nm = Kid(Kid(trak, "udta"), "name");
+                if (nm != null && nm.Payload != null) nm.Payload = name;
+            }
+
+            var newMoov = Serialize(moov);
+            var undo = new AtidMp4Undo(); undo.Length = len;
+            try {
+                if (moovPos + avail == len) {
+                    // header (+ padding) is at the end of the file: rewrite there, adjust length
+                    undo.Offset = moovPos; undo.Bytes = ReadAt(fs, moovPos, (int)avail); undo.Mode = "in place";
+                    WriteAt(fs, moovPos, newMoov);
+                    fs.SetLength(moovPos + newMoov.Length);
+                }
+                else if (newMoov.Length == avail || avail - newMoov.Length >= 8) {
+                    undo.Offset = moovPos; undo.Bytes = ReadAt(fs, moovPos, (int)avail); undo.Mode = "in place";
+                    var buf = new byte[avail];
+                    Buffer.BlockCopy(newMoov, 0, buf, 0, newMoov.Length);
+                    if (avail > newMoov.Length) { Put32(buf, newMoov.Length, (uint)(avail - newMoov.Length)); Encoding.ASCII.GetBytes("free", 0, 4, buf, newMoov.Length + 4); }
+                    WriteAt(fs, moovPos, buf);
+                }
+                else {
+                    if (fragmented) throw new NotSupportedException("fragmented MP4 and the new header does not fit");
+                    if (openEnded) throw new NotSupportedException("last box has open size");
+                    // append the new header first (old one still valid if interrupted), then retire the old one
+                    undo.Offset = moovPos + 4; undo.Bytes = Encoding.ASCII.GetBytes("moov"); undo.Mode = "header moved to end of file";
+                    WriteAt(fs, len, newMoov);
+                    fs.Flush(true);
+                    WriteAt(fs, moovPos + 4, Encoding.ASCII.GetBytes("free"));
+                }
+                fs.Flush(true);
+            }
+            catch (NotSupportedException) { throw; }
+            catch {
+                if (undo.Bytes != null) { try { WriteAt(fs, undo.Offset, undo.Bytes); fs.SetLength(undo.Length); fs.Flush(true); } catch { } }
+                throw;
+            }
+            return undo;
+        }
+    }
+
+    public static void Restore(string path, AtidMp4Undo undo) {
+        using (var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.Read)) {
+            WriteAt(fs, undo.Offset, undo.Bytes);
+            fs.SetLength(undo.Length);
+            fs.Flush(true);
+        }
+    }
+}
+'@
+
+function Set-TracksMp4([string]$File, $Changes, $Tracks) {
+    if (-not ('AtidMp4' -as [type])) { Add-Type -TypeDefinition $Mp4PatcherSource -Language CSharp }
+    $mtime = (Get-Item -LiteralPath $File).LastWriteTime
+    $idx = [int[]]@($Changes | ForEach-Object { $Tracks[$_.AudioIndex].StreamIndex })
+    $langs = [string[]]@($Changes | ForEach-Object { $_.Iso })
+    $titles = [string[]]@($Changes | ForEach-Object { $_.NewTitle })
+    try { $undo = [AtidMp4]::Patch($File, $idx, $langs, $titles) }
+    catch { throw $_.Exception.GetBaseException() }
+    try {
+        # verify with ffprobe: changed tracks carry the new values, all others are untouched
+        $chk = @(Get-AudioTracks $File)
+        if ($chk.Count -ne $Tracks.Count) { throw "audio tracks $($chk.Count) != $($Tracks.Count)" }
+        foreach ($t in $Tracks) {
+            $c = $Changes | Where-Object { $_.AudioIndex -eq $t.AudioIndex } | Select-Object -First 1
+            $wantLang = if ($c) { $c.Iso } else { $t.Language }
+            $wantTitle = if ($c) { $c.NewTitle } else { $t.Title }
+            $got = $chk[$t.AudioIndex]
+            if ($got.Language -ne $wantLang -or $got.Title -cne $wantTitle) {
+                throw "a$($t.AudioIndex + 1) reads back as '$($got.Title)' [$($got.Language)]"
+            }
+        }
+    }
+    catch {
+        [AtidMp4]::Restore($File, $undo)
+        (Get-Item -LiteralPath $File).LastWriteTime = $mtime
+        throw "verification failed, header restored: $($_.Exception.Message)"
+    }
+    (Get-Item -LiteralPath $File).LastWriteTime = $mtime
+    return $undo.Mode
+}
+
 function Set-TracksRemux([string]$File, $Changes, [int]$AudioCount) {
     $ext = [IO.Path]::GetExtension($File)
     $tmp = [IO.Path]::Combine([IO.Path]::GetDirectoryName($File), [IO.Path]::GetFileNameWithoutExtension($File) + '.atid-tmp' + $ext)
@@ -947,9 +1159,17 @@ try {
                         Write-Host "   updated in place (mkvpropedit)" -ForegroundColor Green
                     }
                     else {
+                        $mode = $null
+                        if ($Mp4Extensions -contains $ext) {
+                            try { $mode = Set-TracksMp4 $file $changes $tracks }
+                            catch { Write-Host "   header edit not possible ($($_.Exception.Message))" -ForegroundColor DarkGray }
+                        }
+                        if ($mode) { Write-Host "   updated $mode (MP4 header edit)" -ForegroundColor Green }
+                        else {
                         Write-Host '   remuxing (stream copy) ...' -NoNewline
                         Set-TracksRemux $file $changes $tracks.Count
                         Write-Host ' done' -ForegroundColor Green
+                        }
                     }
                     foreach ($c in $changes) { $c.Row.Status = 'renamed' }
                 }

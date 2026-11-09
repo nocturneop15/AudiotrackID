@@ -73,8 +73,14 @@ AudiotrackID.cmd -Setup                      # download/update all tools (for of
    until the result is clear or `-MaxTime` is reached.
 4. If the result is confident enough, the language tag (ISO 639-2) and title are written:
    * **MKV / WebM / MKA**: in place with `mkvpropedit` (instant, no rewrite)
-   * **MP4 / MOV / AVI / TS / ...**: lossless `ffmpeg -c copy` remux to a temp file. It is checked,
-     swapped in, and the original modification time is kept.
+   * **MP4 / M4V / MOV / 3GP**: only the small `moov` header is rewritten (track language and
+     name), the media data is never touched, so this takes well under a second even on a network
+     drive. If the new header no longer fits in place, the old one is marked as free space and the
+     new one is appended at the end of the file (the file grows by its size, typically a few hundred
+     KB, and loses "fast start" for web streaming). The result is checked with `ffprobe`; on any
+     problem the header is restored and the file is remuxed instead.
+   * **AVI / TS / M2TS / ...** (and unusual MP4s, e.g. fragmented): lossless `ffmpeg -c copy` remux
+     to a temp file. It is checked, swapped in, and the original modification time is kept.
 
 ## GPU acceleration
 
