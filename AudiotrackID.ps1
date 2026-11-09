@@ -727,6 +727,19 @@ function Set-TracksRemux([string]$File, $Changes, [int]$AudioCount) {
 # ---------------------------------------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------------------------------------
+# Keep the console window open at the end only when started from Explorer (double-click /
+# drag & drop / Send to) - detected as: this process <- cmd.exe launcher <- explorer.exe.
+$PauseAtEnd = $false
+if ($env:ATID_LAUNCHER) {
+    try {
+        $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$PID"
+        $cmd = Get-CimInstance Win32_Process -Filter "ProcessId=$($parent.ParentProcessId)"
+        $grand = Get-Process -Id $cmd.ParentProcessId -ErrorAction Stop
+        $PauseAtEnd = $grand.ProcessName -eq 'explorer'
+    } catch {}
+}
+
+try {
 if ($Model -like '*.en') { throw "Model '$Model' is English-only; use a multilingual model (tiny, base, small, medium, large-v3, large-v3-turbo)." }
 
 if ($Setup) {
@@ -929,4 +942,8 @@ else { Write-Host '  nothing to do - all audio tracks already carry a language i
 if ($Report) {
     $rows | Export-Csv -LiteralPath $Report -NoTypeInformation -Encoding UTF8
     Write-Host "Report written to $Report"
+}
+}
+finally {
+    if ($PauseAtEnd) { Write-Host ''; [void](Read-Host 'Press Enter to close') }
 }

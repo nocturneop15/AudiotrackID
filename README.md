@@ -3,6 +3,28 @@
 Portable Windows tool that finds video files in a folder, identifies the spoken language of every
 audio track that has no language in its title (using Whisper), and tags/renames those tracks.
 
+## Install
+
+In PowerShell (no admin rights needed):
+
+```powershell
+irm https://raw.githubusercontent.com/nocturneop15/AudiotrackID/main/install.ps1 | iex
+```
+
+This installs to `%LOCALAPPDATA%\AudiotrackID`, adds an `AudiotrackID` command to your user PATH,
+and adds **Send to → AudiotrackID** to Explorer's right-click menu. Running it again updates the
+scripts and keeps the downloaded tools. Options:
+
+```powershell
+$i = [scriptblock]::Create((irm https://raw.githubusercontent.com/nocturneop15/AudiotrackID/main/install.ps1))
+& $i -InstallDir 'D:\Tools\AudiotrackID'   # other folder
+& $i -Setup                                # download tools + models now instead of on first run
+& $i -NoPath -NoSendTo                     # files only
+& $i -Uninstall                            # remove everything again
+```
+
+Or skip installing: download/clone the repository and use `AudiotrackID.cmd` from that folder.
+
 ## Usage
 
 Drag a folder (or video files) onto `AudiotrackID.cmd`, or from a console:
